@@ -36,10 +36,11 @@ from models.loss import OFLoss, FocalLoss
 from utils.pvn3d_eval_utils_kpls import TorchEval
 from utils.basic_utils import Basic_Utils
 import datasets.linemod.linemod_dataset as dataset_desc
-
 from apex.parallel import DistributedDataParallel
 from apex.parallel import convert_syncbn_model
+
 from apex import amp
+
 from apex.multi_tensor_apply import multi_tensor_applier
 
 
@@ -108,7 +109,6 @@ parser.add_argument('--keep_batchnorm_fp32', default=True)
 parser.add_argument('--opt_level', default="O0", type=str,
                     help='opt level of apex mix presision trainig.')
 args = parser.parse_args()
-
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
 config = Config(ds_name='linemod', cls_type=args.cls)
@@ -242,7 +242,6 @@ def model_fn_decorator(
                     cu_dt[key] = data[key].float().cuda()
                 elif data[key].dtype in [torch.int32, torch.int16]:
                     cu_dt[key] = data[key].long().cuda()
-
             end_points = model(cu_dt)
 
             labels = cu_dt['labels']
@@ -260,6 +259,7 @@ def model_fn_decorator(
                 (loss_rgbd_seg, 2.0), (loss_kp_of, 1.0), (loss_ctr_of, 1.0),
             ]
             loss = sum([ls * w for ls, w in loss_lst])
+            
 
             _, cls_rgbd = torch.max(end_points['pred_rgbd_segs'], 1)
             acc_rgbd = (cls_rgbd == labels).float().sum() / labels.numel()
@@ -295,7 +295,6 @@ def model_fn_decorator(
                     writer.add_scalars('train_acc', acc_dict, it)
             if is_test and test_pose:
                 cld = cu_dt['cld_rgb_nrm'][:, :3, :].permute(0, 2, 1).contiguous()
-
                 if not args.test_gt:
                     # eval pose from point cloud prediction.
                     teval.eval_pose_parallel(
@@ -306,6 +305,8 @@ def model_fn_decorator(
                         ds='linemod', obj_id=config.cls_id,
                         min_cnt=1, use_ctr_clus_flter=True, use_ctr=True,
                     )
+                    
+                    
                 else:
                     # test GT labels, keypoint and center point offset
                     gt_ctr_ofs = cu_dt['ctr_targ_ofst'].unsqueeze(2).permute(0, 2, 1, 3)
@@ -382,7 +383,6 @@ class Trainer(object):
         ):
             count += 1
             self.optimizer.zero_grad()
-
             _, loss, eval_res = self.model_fn(
                 self.model, data, is_eval=True, is_test=is_test, test_pose=test_pose
             )
@@ -435,6 +435,7 @@ class Trainer(object):
         tot_iter=1,
         clr_div=6,
     ):
+        
         r"""
            Call to begin training the model
 
@@ -482,12 +483,18 @@ class Trainer(object):
                 np.random.seed()
                 if log_epoch_f is not None:
                     os.system("echo {} > {}".format(epoch, log_epoch_f))
+                    
                 for batch in train_loader:
                     self.model.train()
 
                     self.optimizer.zero_grad()
                     _, loss, res = self.model_fn(self.model, batch, it=it)
 
+                    
+                    
+                    
+                    
+                    
                     with amp.scale_loss(loss, self.optimizer) as scaled_loss:
                         scaled_loss.backward()
                     lr = get_lr(self.optimizer)
@@ -551,6 +558,23 @@ class Trainer(object):
         return best_loss
 
 
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
 def train():
     print("local_rank:", args.local_rank)
     cudnn.benchmark = True
@@ -573,6 +597,13 @@ def train():
             train_ds, batch_size=config.mini_batch_size, shuffle=False,
             drop_last=True, num_workers=4, sampler=train_sampler, pin_memory=True
         )
+        
+        
+        
+        
+        
+        
+        
 
         val_ds = dataset_desc.Dataset('test', cls_type=args.cls)
         val_sampler = torch.utils.data.distributed.DistributedSampler(val_ds)
