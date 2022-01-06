@@ -1,0 +1,1 @@
+commandline: -I/home/floydsim/anaconda3/envs/ffb/lib/python3.5/site-packages/numpy/core/include -I/home/floydsim/anaconda3/envs/ffb/include/python3.5m -c-std=c++11 -D_GLIBCXX_USE_CXX11_ABI=0-I/home/floydsim/anaconda3/envs/ffb/lib/python3.5/site-packages/numpy/core/include -I/home/floydsim/anaconda3/envs/ffb/include/python3.5m

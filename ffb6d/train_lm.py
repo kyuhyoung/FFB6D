@@ -46,7 +46,7 @@ parser.add_argument(
     help="L2 regularization coeff [default: 0.0]",
 )
 parser.add_argument(
-    "-lr", type=float, default=1e-2,
+    "-lr", type=float, default=1e-3,
     help="Initial learning rate [default: 1e-2]"
 )
 parser.add_argument(
@@ -105,7 +105,6 @@ parser.add_argument('--keep_batchnorm_fp32', default=True)
 parser.add_argument('--opt_level', default="O0", type=str,
                     help='opt level of apex mix presision trainig.')
 args = parser.parse_args()
-
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
 config = Config(ds_name='linemod', cls_type=args.cls)
@@ -239,7 +238,8 @@ def model_fn_decorator(
                     cu_dt[key] = data[key].float().cuda()
                 elif data[key].dtype in [torch.int32, torch.int16]:
                     cu_dt[key] = data[key].long().cuda()
-
+            # from torch.cuda.amp import autocast
+            # with autocast():
             end_points = model(cu_dt)
 
             labels = cu_dt['labels']
@@ -257,6 +257,7 @@ def model_fn_decorator(
                 (loss_rgbd_seg, 2.0), (loss_kp_of, 1.0), (loss_ctr_of, 1.0),
             ]
             loss = sum([ls * w for ls, w in loss_lst])
+            # print('Total loss:{} in {} iter.'.format(loss, it))
 
             _, cls_rgbd = torch.max(end_points['pred_rgbd_segs'], 1)
             acc_rgbd = (cls_rgbd == labels).float().sum() / labels.numel()
@@ -290,12 +291,11 @@ def model_fn_decorator(
                 if args.local_rank == 0:
                     writer.add_scalars('loss', loss_dict, it)
                     writer.add_scalars('train_acc', acc_dict, it)
-            if is_test and test_pose:
+            if is_test:
                 cld = cu_dt['cld_rgb_nrm'][:, :3, :].permute(0, 2, 1).contiguous()
-
                 if not args.test_gt:
                     # eval pose from point cloud prediction.
-                    teval.eval_pose_parallel(
+                    pred_pose_lst = teval.eval_pose_parallel(
                         cld, cu_dt['rgb'], cls_rgbd, end_points['pred_ctr_ofs'],
                         cu_dt['ctr_targ_ofst'], labels, epoch, cu_dt['cls_ids'],
                         cu_dt['RTs'], end_points['pred_kp_ofs'],
@@ -303,6 +303,8 @@ def model_fn_decorator(
                         ds='linemod', obj_id=config.cls_id,
                         min_cnt=1, use_ctr_clus_flter=True, use_ctr=True,
                     )
+                    teval.cal_view_pred_pose(rgb=cu_dt['rgb'], pred_pose_lst=pred_pose_lst, \
+                                             obj_id=config.cls_id, dataset='linemod',filename=it)
                 else:
                     # test GT labels, keypoint and center point offset
                     gt_ctr_ofs = cu_dt['ctr_targ_ofst'].unsqueeze(2).permute(0, 2, 1, 3)
@@ -379,9 +381,8 @@ class Trainer(object):
         ):
             count += 1
             self.optimizer.zero_grad()
-
             _, loss, eval_res = self.model_fn(
-                self.model, data, is_eval=True, is_test=is_test, test_pose=test_pose
+                self.model, data, is_eval=True, is_test=is_test, test_pose=test_pose, it=i
             )
 
             if 'loss_target' in eval_res.keys():
@@ -394,7 +395,7 @@ class Trainer(object):
 
         mean_eval_dict = {}
         acc_dict = {}
-        for k, v in eval_dict.items():
+        for k, v in eval_res.items():
             per = 100 if 'acc' in k else 1
             mean_eval_dict[k] = np.array(v).mean() * per
             if 'acc' in k:
@@ -548,6 +549,45 @@ class Trainer(object):
         return best_loss
 
 
+def MMD(x, y, kernel):
+    device = torch.device('cuda:{}'.format(args.local_rank))
+    """Emprical maximum mean discrepancy. The lower the result
+       the more evidence that distributions are the same.
+
+    Args:
+        x: first sample, distribution P
+        y: second sample, distribution Q
+        kernel: kernel type such as "multiscale" or "rbf"
+    """
+    xx, yy, zz = torch.mm(x, x.t()), torch.mm(y, y.t()), torch.mm(x, y.t())
+    rx = (xx.diag().unsqueeze(0).expand_as(xx))
+    ry = (yy.diag().unsqueeze(0).expand_as(yy))
+
+    dxx = rx.t() + rx - 2. * xx  # Used for A in (1)
+    dyy = ry.t() + ry - 2. * yy  # Used for B in (1)
+    dxy = rx.t() + ry - 2. * zz  # Used for C in (1)
+
+    XX, YY, XY = (torch.zeros(xx.shape).to(device),
+                  torch.zeros(xx.shape).to(device),
+                  torch.zeros(xx.shape).to(device))
+
+    if kernel == "multiscale":
+
+        bandwidth_range = [0.2, 0.5, 0.9, 1.3]
+        for a in bandwidth_range:
+            XX += a ** 2 * (a ** 2 + dxx) ** -1
+            YY += a ** 2 * (a ** 2 + dyy) ** -1
+            XY += a ** 2 * (a ** 2 + dxy) ** -1
+
+    if kernel == "rbf":
+
+        bandwidth_range = [10, 15, 20, 50]
+        for a in bandwidth_range:
+            XX += torch.exp(-0.5 * dxx / a)
+            YY += torch.exp(-0.5 * dyy / a)
+            XY += torch.exp(-0.5 * dxy / a)
+
+    return torch.mean(XX + YY - 2. * XY)
 def train():
     print("local_rank:", args.local_rank)
     cudnn.benchmark = True
@@ -571,14 +611,14 @@ def train():
             drop_last=True, num_workers=4, sampler=train_sampler, pin_memory=True
         )
 
-        val_ds = dataset_desc.Dataset('test', cls_type=args.cls)
+        val_ds = dataset_desc.Dataset('valid', cls_type=args.cls)
         val_sampler = torch.utils.data.distributed.DistributedSampler(val_ds)
         val_loader = torch.utils.data.DataLoader(
             val_ds, batch_size=config.val_mini_batch_size, shuffle=False,
             drop_last=False, num_workers=4, sampler=val_sampler
         )
     else:
-        test_ds = dataset_desc.Dataset('test', cls_type=args.cls)
+        test_ds = dataset_desc.Dataset('Unity_test', cls_type=args.cls)
         test_loader = torch.utils.data.DataLoader(
             test_ds, batch_size=config.test_mini_batch_size, shuffle=False,
             num_workers=10

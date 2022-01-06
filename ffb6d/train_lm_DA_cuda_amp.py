@@ -5,6 +5,9 @@ from __future__ import (
     print_function,
     unicode_literals,
 )
+# ignore warnings
+import warnings
+warnings.filterwarnings('ignore')
 import os
 import time
 import tqdm
@@ -15,7 +18,8 @@ import numpy as np
 import cv2
 import pickle as pkl
 from collections import namedtuple
-
+from cv2 import imshow, waitKey
+from itertools import cycle
 import torch
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_sched
@@ -26,33 +30,18 @@ import torch.backends.cudnn as cudnn
 from tensorboardX import SummaryWriter
 
 from common import Config, ConfigRandLA
-import datasets.ycb.ycb_dataset as dataset_desc
-from utils.pvn3d_eval_utils_kpls import TorchEval
-from utils.basic_utils import Basic_Utils
-
 import models.pytorch_utils as pt_utils
 from models.ffb6d import FFB6D
 from models.loss import OFLoss, FocalLoss
-
+from utils.pvn3d_eval_utils_kpls import TorchEval
+from utils.basic_utils import Basic_Utils
+import datasets.linemod.linemod_dataset as dataset_desc
 from apex.parallel import DistributedDataParallel
 from apex.parallel import convert_syncbn_model
-from apex import amp
-from apex.multi_tensor_apply import multi_tensor_applier
 
-
-config = Config()
-bs_utils = Basic_Utils(config)
-writer = SummaryWriter(log_dir=config.log_traininfo_dir)
-
-rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
-resource.setrlimit(resource.RLIMIT_NOFILE, (30000, rlimit[1]))
-
-color_lst = [(0, 0, 0)]
-for i in range(config.n_objects):
-    col_mul = (255 * 255 * 255) // (i+1)
-    color = (col_mul//(255*255), (col_mul//255) % 255, col_mul % 255)
-    color_lst.append(color)
-
+from torch.cuda import amp
+from torch.cuda.amp import autocast
+# from apex.multi_tensor_apply import multi_tensor_applier
 
 parser = argparse.ArgumentParser(description="Arg parser")
 parser.add_argument(
@@ -60,7 +49,7 @@ parser.add_argument(
     help="L2 regularization coeff [default: 0.0]",
 )
 parser.add_argument(
-    "-lr", type=float, default=1e-2,
+    "-lr", type=float, default=1e-3,
     help="Initial learning rate [default: 1e-2]"
 )
 parser.add_argument(
@@ -89,6 +78,14 @@ parser.add_argument(
 parser.add_argument(
     "-eval_net", action='store_true', help="whether is to eval net."
 )
+parser.add_argument(
+    '--cls', type=str, default="ape",
+    help="Target object. (ape, benchvise, cam, can, cat, driller," +
+    "duck, eggbox, glue, holepuncher, iron, lamp, phone)"
+)
+parser.add_argument(
+    '--test_occ', action="store_true", help="To eval occlusion linemod or not."
+)
 parser.add_argument("-test", action="store_true")
 parser.add_argument("-test_pose", action="store_true")
 parser.add_argument("-test_gt", action="store_true")
@@ -103,15 +100,29 @@ parser.add_argument('-g', '--gpus', default=8, type=int,
                     help='number of gpus per node')
 parser.add_argument('-nr', '--nr', default=0, type=int,
                     help='ranking within the nodes')
+parser.add_argument('--epochs', default=2, type=int,
+                    metavar='N', help='number of total epochs to run')
 parser.add_argument('--gpu', type=str, default="0,1,2,3,4,5,6,7")
 parser.add_argument('--deterministic', action='store_true')
 parser.add_argument('--keep_batchnorm_fp32', default=True)
 parser.add_argument('--opt_level', default="O0", type=str,
                     help='opt level of apex mix presision trainig.')
-
 args = parser.parse_args()
-
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+
+config = Config(ds_name='linemod', cls_type=args.cls)
+bs_utils = Basic_Utils(config)
+writer = SummaryWriter(log_dir=config.log_traininfo_dir)
+
+rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (30000, rlimit[1]))
+scaler = torch.cuda.amp.GradScaler()
+
+color_lst = [(0, 0, 0)]
+for i in range(config.n_objects):
+    col_mul = (255 * 255 * 255) // (i+1)
+    color = (col_mul//(255*255), (col_mul//255) % 255, col_mul % 255)
+    color_lst.append(color)
 
 
 lr_clip = 1e-5
@@ -144,9 +155,8 @@ def checkpoint_state(model=None, optimizer=None, best_prec=None, epoch=None, it=
         "best_prec": best_prec,
         "model_state": model_state,
         "optimizer_state": optim_state,
-        "amp": amp.state_dict(),
+        "model": model.state_dict(),
     }
-
 
 def save_checkpoint(
         state, is_best, filename="checkpoint", bestname="model_best",
@@ -164,29 +174,29 @@ def load_checkpoint(model=None, optimizer=None, filename="checkpoint"):
 
     if os.path.isfile(filename):
         print("==> Loading from checkpoint '{}'".format(filename))
-        checkpoint = torch.load(filename)
-        epoch = checkpoint["epoch"]
-        it = checkpoint.get("it", 0.0)
-        best_prec = checkpoint["best_prec"]
-        if model is not None and checkpoint["model_state"] is not None:
-            ck_st = checkpoint['model_state']
+        ck = torch.load(filename)
+        epoch = ck.get("epoch", 0)
+        it = ck.get("it", 0.0)
+        best_prec = ck.get("best_prec", None)
+        if model is not None and ck["model_state"] is not None:
+            ck_st = ck['model_state']
             if 'module' in list(ck_st.keys())[0]:
                 tmp_ck_st = {}
                 for k, v in ck_st.items():
                     tmp_ck_st[k.replace("module.", "")] = v
                 ck_st = tmp_ck_st
             model.load_state_dict(ck_st)
-        if optimizer is not None and checkpoint["optimizer_state"] is not None:
-            optimizer.load_state_dict(checkpoint["optimizer_state"])
-        amp.load_state_dict(checkpoint["amp"])
+        if optimizer is not None and ck["optimizer_state"] is not None:
+            optimizer.load_state_dict(ck["optimizer_state"])
+        if ck.get("model", None) is not None:
+            model.load_state_dict(ck["amp"])
         print("==> Done")
         return it, epoch, best_prec
     else:
-        print("==> Checkpoint '{}' not found".format(filename))
+        print("==> ck '{}' not found".format(filename))
         return None
 
-
-def view_labels(rgb_chw, cld_cn, labels, K=config.intrinsic_matrix['ycb_K1']):
+def view_labels(rgb_chw, cld_cn, labels, K=config.intrinsic_matrix['linemod']):
     rgb_hwc = np.transpose(rgb_chw[0].numpy(), (1, 2, 0)).astype("uint8").copy()
     cld_nc = np.transpose(cld_cn.numpy(), (1, 0)).copy()
     p2ds = bs_utils.project_p3d(cld_nc, 1.0, K).astype(np.int32)
@@ -214,23 +224,30 @@ def model_fn_decorator(
         test_pose=False
     ):
         if finish_test:
-            teval.cal_auc()
+            teval.cal_lm_add(config.cls_id)
             return None
         if is_eval:
             model.eval()
         with torch.set_grad_enabled(not is_eval):
             cu_dt = {}
-            # device = torch.device('cuda:{}'.format(args.local_rank))
+            # for key in data.keys():
+            #     if data[key].dtype in [np.float32, np.uint8]:
+            #         cu_dt[key] = torch.from_numpy(data[key].astype(np.float32)).cuda()
+            #     elif data[key].dtype in [np.int32, np.uint32]:
+            #         cu_dt[key] = torch.LongTensor(data[key].astype(np.int32)).cuda()
+            #     elif data[key].dtype in [torch.uint8, torch.float32]:
+            #         cu_dt[key] = data[key].float().cuda()
+            #     elif data[key].dtype in [torch.int32, torch.int16]:
+            #         cu_dt[key] = data[key].long().cuda()
             for key in data.keys():
                 if data[key].dtype in [np.float32, np.uint8]:
-                    cu_dt[key] = torch.from_numpy(data[key].astype(np.float32)).cuda()
+                    cu_dt[key] = torch.from_numpy(data[key]).cuda()
                 elif data[key].dtype in [np.int32, np.uint32]:
-                    cu_dt[key] = torch.LongTensor(data[key].astype(np.int32)).cuda()
+                    cu_dt[key] = torch.LongTensor(data[key]).cuda()
                 elif data[key].dtype in [torch.uint8, torch.float32]:
                     cu_dt[key] = data[key].float().cuda()
                 elif data[key].dtype in [torch.int32, torch.int16]:
                     cu_dt[key] = data[key].long().cuda()
-
             end_points = model(cu_dt)
 
             labels = cu_dt['labels']
@@ -248,9 +265,20 @@ def model_fn_decorator(
                 (loss_rgbd_seg, 2.0), (loss_kp_of, 1.0), (loss_ctr_of, 1.0),
             ]
             loss = sum([ls * w for ls, w in loss_lst])
-
             _, cls_rgbd = torch.max(end_points['pred_rgbd_segs'], 1)
             acc_rgbd = (cls_rgbd == labels).float().sum() / labels.numel()
+
+            if args.debug:
+                show_lb = view_labels(
+                    data['rgb'], data['cld_rgb_nrm'][0, :3, :], cls_rgbd
+                )
+                show_gt_lb = view_labels(
+                    data['rgb'], data['cld_rgb_nrm'][0, :3, :],
+                    cu_dt['labels'].squeeze()
+                )
+                imshow("pred_lb", show_lb)
+                imshow('gt_lb', show_gt_lb)
+                waitKey(0)
 
             loss_dict = {
                 'loss_rgbd_seg': loss_rgbd_seg.item(),
@@ -269,18 +297,20 @@ def model_fn_decorator(
                 if args.local_rank == 0:
                     writer.add_scalars('loss', loss_dict, it)
                     writer.add_scalars('train_acc', acc_dict, it)
-            if is_test and test_pose:
+            if is_test:
                 cld = cu_dt['cld_rgb_nrm'][:, :3, :].permute(0, 2, 1).contiguous()
-
                 if not args.test_gt:
                     # eval pose from point cloud prediction.
-                    teval.eval_pose_parallel(
+                    pred_pose_lst = teval.eval_pose_parallel(
                         cld, cu_dt['rgb'], cls_rgbd, end_points['pred_ctr_ofs'],
                         cu_dt['ctr_targ_ofst'], labels, epoch, cu_dt['cls_ids'],
                         cu_dt['RTs'], end_points['pred_kp_ofs'],
-                        cu_dt['kp_3ds'], cu_dt['ctr_3ds'], min_cnt=1,
-                        use_ctr_clus_flter=True, use_ctr=True, ds='ycb'
+                        cu_dt['kp_3ds'], cu_dt['ctr_3ds'],
+                        ds='linemod', obj_id=config.cls_id,
+                        min_cnt=1, use_ctr_clus_flter=True, use_ctr=True,
                     )
+                    teval.cal_view_pred_pose(rgb=cu_dt['rgb'], pred_pose_lst=pred_pose_lst, \
+                                             obj_id=config.cls_id, dataset='linemod',filename=it)
                 else:
                     # test GT labels, keypoint and center point offset
                     gt_ctr_ofs = cu_dt['ctr_targ_ofst'].unsqueeze(2).permute(0, 2, 1, 3)
@@ -288,13 +318,15 @@ def model_fn_decorator(
                     teval.eval_pose_parallel(
                         cld, cu_dt['rgb'], labels, gt_ctr_ofs,
                         cu_dt['ctr_targ_ofst'], labels, epoch, cu_dt['cls_ids'],
-                        cu_dt['RTs'], gt_kp_ofs, cu_dt['kp_3ds'], cu_dt['ctr_3ds'],
-                        min_cnt=1, use_ctr_clus_flter=True, use_ctr=True, ds='ycb'
+                        cu_dt['RTs'], gt_kp_ofs,
+                        cu_dt['kp_3ds'], cu_dt['ctr_3ds'],
+                        ds='linemod', obj_id=config.cls_id,
+                        min_cnt=1, use_ctr_clus_flter=True, use_ctr=True
                     )
 
-        return (
-            end_points, loss, info_dict
-        )
+            return (
+                end_points, loss, info_dict
+            )
 
     return model_fn
 
@@ -355,9 +387,8 @@ class Trainer(object):
         ):
             count += 1
             self.optimizer.zero_grad()
-
             _, loss, eval_res = self.model_fn(
-                self.model, data, is_eval=True, is_test=is_test, test_pose=test_pose
+                self.model, data, is_eval=True, is_test=is_test, test_pose=test_pose, it=i
             )
 
             if 'loss_target' in eval_res.keys():
@@ -400,7 +431,8 @@ class Trainer(object):
         start_it,
         start_epoch,
         n_epochs,
-        train_loader,
+        source_loader, # source: linemod
+        target_loader, # target: linemod-Unity & raster-triangle
         train_sampler,
         test_loader=None,
         best_loss=0.0,
@@ -419,7 +451,7 @@ class Trainer(object):
             Number of epochs to train for
         test_loader : torch.utils.data.DataLoader
             DataLoader of the test_data
-        train_loader : torch.utils.data.DataLoader
+        source_loader : torch.utils.data.DataLoader
             DataLoader of training data
         best_loss : float
             Testing loss of the best model
@@ -428,7 +460,6 @@ class Trainer(object):
         print("Totally train %d iters per gpu." % tot_iter)
 
         def is_to_eval(epoch, it):
-            # Eval after first 100 iters to test eval function.
             if it == 100:
                 return True, 1
             wid = tot_iter // clr_div
@@ -442,9 +473,10 @@ class Trainer(object):
         it = start_it
         _, eval_frequency = is_to_eval(0, it)
 
-        with tqdm.tqdm(range(config.n_total_epoch), desc="epochs") as tbar, tqdm.tqdm(
+        with tqdm.tqdm(range(config.n_total_epoch), desc="%s_epochs" % args.cls) as tbar, tqdm.tqdm(
             total=eval_frequency, leave=False, desc="train"
         ) as pbar:
+
             for epoch in tbar:
                 if epoch > config.n_total_epoch:
                     break
@@ -455,15 +487,23 @@ class Trainer(object):
                 np.random.seed()
                 if log_epoch_f is not None:
                     os.system("echo {} > {}".format(epoch, log_epoch_f))
-                for batch in train_loader:
+                # source and target batches for domain adaptation
+                for source_batch, target_batch in zip(source_loader, cycle(target_loader)):
                     self.model.train()
-
+                    # Forward with source
                     self.optimizer.zero_grad()
-                    _, loss, res = self.model_fn(self.model, batch, it=it)
+                    with autocast():
+                        end_points, kp_loss, res = self.model_fn(self.model, source_batch, it=it)
+                        source_feature = end_points['kp_feature'].reshape(config.mini_batch_size, -1)
+                        # Forward with target
 
-                    with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-                        scaled_loss.backward()
+                        end_points, _, res = self.model_fn(self.model, target_batch, it=it)
+                        target_feature = end_points['kp_feature'].reshape(config.mini_batch_size, -1)
+                        domain_loss = MMD(x=source_feature, y=target_feature, kernel='multiscale')
+                        total_loss = kp_loss +  config.l1*domain_loss # + structure loss
+                    scaler.scale(total_loss).backward
                     lr = get_lr(self.optimizer)
+
                     if args.local_rank == 0:
                         writer.add_scalar('lr/lr', lr, it)
 
@@ -524,6 +564,45 @@ class Trainer(object):
         return best_loss
 
 
+def MMD(x, y, kernel):
+    device = torch.device('cuda:{}'.format(args.local_rank))
+    """Emprical maximum mean discrepancy. The lower the result
+       the more evidence that distributions are the same.
+
+    Args:
+        x: first sample, distribution P
+        y: second sample, distribution Q
+        kernel: kernel type such as "multiscale" or "rbf"
+    """
+    xx, yy, zz = torch.mm(x, x.t()), torch.mm(y, y.t()), torch.mm(x, y.t())
+    rx = (xx.diag().unsqueeze(0).expand_as(xx))
+    ry = (yy.diag().unsqueeze(0).expand_as(yy))
+
+    dxx = rx.t() + rx - 2. * xx  # Used for A in (1)
+    dyy = ry.t() + ry - 2. * yy  # Used for B in (1)
+    dxy = rx.t() + ry - 2. * zz  # Used for C in (1)
+
+    XX, YY, XY = (torch.zeros(xx.shape).to(device),
+                  torch.zeros(xx.shape).to(device),
+                  torch.zeros(xx.shape).to(device))
+
+    if kernel == "multiscale":
+
+        bandwidth_range = [0.2, 0.5, 0.9, 1.3]
+        for a in bandwidth_range:
+            XX += a ** 2 * (a ** 2 + dxx) ** -1
+            YY += a ** 2 * (a ** 2 + dyy) ** -1
+            XY += a ** 2 * (a ** 2 + dxy) ** -1
+
+    if kernel == "rbf":
+
+        bandwidth_range = [10, 15, 20, 50]
+        for a in bandwidth_range:
+            XX += torch.exp(-0.5 * dxx / a)
+            YY += torch.exp(-0.5 * dyy / a)
+            XY += torch.exp(-0.5 * dxy / a)
+
+    return torch.mean(XX + YY - 2. * XY)
 def train():
     print("local_rank:", args.local_rank)
     cudnn.benchmark = True
@@ -540,24 +619,31 @@ def train():
     torch.manual_seed(0)
 
     if not args.eval_net:
-        train_ds = dataset_desc.Dataset('train')
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds)
-        train_loader = torch.utils.data.DataLoader(
-            train_ds, batch_size=config.mini_batch_size, shuffle=False,
-            drop_last=True, num_workers=4, sampler=train_sampler, pin_memory=True
+        # source dataset
+        source_ds = dataset_desc.Dataset('source', cls_type=args.cls)
+        source_sampler = torch.utils.data.distributed.DistributedSampler(source_ds)
+        source_loader = torch.utils.data.DataLoader(
+            source_ds, batch_size=config.mini_batch_size, shuffle=False,
+            drop_last=True, num_workers=4, sampler=source_sampler, pin_memory=True
         )
-
-        val_ds = dataset_desc.Dataset('test')
+        # target dataset
+        target_ds = dataset_desc.Dataset('target', cls_type=args.cls)
+        target_sampler = torch.utils.data.distributed.DistributedSampler(target_ds)
+        target_loader = torch.utils.data.DataLoader(
+            target_ds, batch_size=config.mini_batch_size, shuffle=False,
+            drop_last=True, num_workers=4, sampler=target_sampler, pin_memory=True
+        )
+        val_ds = dataset_desc.Dataset('valid', cls_type=args.cls)
         val_sampler = torch.utils.data.distributed.DistributedSampler(val_ds)
         val_loader = torch.utils.data.DataLoader(
             val_ds, batch_size=config.val_mini_batch_size, shuffle=False,
             drop_last=False, num_workers=4, sampler=val_sampler
         )
     else:
-        test_ds = dataset_desc.Dataset('test')
+        test_ds = dataset_desc.Dataset('Unity_test', cls_type=args.cls)
         test_loader = torch.utils.data.DataLoader(
             test_ds, batch_size=config.test_mini_batch_size, shuffle=False,
-            num_workers=20
+            num_workers=10
         )
 
     rndla_cfg = ConfigRandLA
@@ -572,10 +658,6 @@ def train():
     optimizer = optim.Adam(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
-    opt_level = args.opt_level
-    model, optimizer = amp.initialize(
-        model, optimizer, opt_level=opt_level,
-    )
 
     # default value
     it = -1  # for the initialize value of `LambdaLR` and `BNMomentumScheduler`
@@ -584,9 +666,14 @@ def train():
 
     # load status from checkpoint
     if args.checkpoint is not None:
-        checkpoint_status = load_checkpoint(
-            model, optimizer, filename=args.checkpoint[:-8]
-        )
+        if args.eval_net:
+            checkpoint_status = load_checkpoint(
+                model, None, filename=args.checkpoint[:-8]
+            )
+        else:
+            checkpoint_status = load_checkpoint(
+                model, optimizer, filename=args.checkpoint[:-8]
+            )
         if checkpoint_status is not None:
             it, start_epoch, best_loss = checkpoint_status
         if args.eval_net:
@@ -595,21 +682,22 @@ def train():
     if not args.eval_net:
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[args.local_rank], output_device=args.local_rank,
-            find_unused_parameters=True
+            find_unused_parameters=False
         )
-        clr_div = 6
+        clr_div = 2
         lr_scheduler = CyclicLR(
             optimizer, base_lr=1e-5, max_lr=1e-3,
             cycle_momentum=False,
-            step_size_up=config.n_total_epoch * train_ds.minibatch_per_epoch // clr_div // args.gpus,
-            step_size_down=config.n_total_epoch * train_ds.minibatch_per_epoch // clr_div // args.gpus,
+            step_size_up=config.n_total_epoch * source_ds.minibatch_per_epoch // clr_div // args.gpus,
+            step_size_down=config.n_total_epoch * source_ds.minibatch_per_epoch // clr_div // args.gpus,
             mode='triangular'
         )
     else:
         lr_scheduler = None
 
     bnm_lmbd = lambda it: max(
-        args.bn_momentum * args.bn_decay ** (int(it * config.mini_batch_size / args.decay_step)),
+        args.bn_momentum
+        * args.bn_decay ** (int(it * config.mini_batch_size / args.decay_step)),
         bnm_clip,
     )
     bnm_scheduler = pt_utils.BNMomentumScheduler(
@@ -635,8 +723,8 @@ def train():
         model,
         model_fn,
         optimizer,
-        checkpoint_name=os.path.join(checkpoint_fd, "FFB6D"),
-        best_name=os.path.join(checkpoint_fd, "FFB6D_best"),
+        checkpoint_name=os.path.join(checkpoint_fd, "FFB6D_%s" % args.cls),
+        best_name=os.path.join(checkpoint_fd, "FFB6D_%s_best" % args.cls),
         lr_scheduler=lr_scheduler,
         bnm_scheduler=bnm_scheduler,
     )
@@ -650,9 +738,9 @@ def train():
         print("\nUse time: ", end - start, 's')
     else:
         trainer.train(
-            it, start_epoch, config.n_total_epoch, train_loader, None,
+            it, start_epoch, config.n_total_epoch, source_loader, target_loader, None,
             val_loader, best_loss=best_loss,
-            tot_iter=config.n_total_epoch * train_ds.minibatch_per_epoch // args.gpus,
+            tot_iter=config.n_total_epoch * source_ds.minibatch_per_epoch // args.gpus,
             clr_div=clr_div
         )
 

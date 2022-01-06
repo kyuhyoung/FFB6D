@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from models.cnn.pspnet import PSPNet
 import models.pytorch_utils as pt_utils
 from models.RandLA.RandLANet import Network as RandLANet
+from torch.cuda.amp import autocast
 
 
 psp_models = {
@@ -200,6 +201,7 @@ class FFB6D(nn.Module):
         )
         return xyz, features
 
+    @autocast()
     def forward(
         self, inputs, end_points=None, scale=1,
     ):
@@ -333,6 +335,7 @@ class FFB6D(nn.Module):
         end_points['pred_rgbd_segs'] = rgbd_segs
         end_points['pred_kp_ofs'] = pred_kp_ofs
         end_points['pred_ctr_ofs'] = pred_ctr_ofs
+        end_points['kp_feature'] = rgbd_emb
 
         return end_points
 

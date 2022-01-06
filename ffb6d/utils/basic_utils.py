@@ -3,6 +3,8 @@ import os
 import cv2
 import random
 import torch
+import torch.nn as nn
+
 import numpy as np
 
 from plyfile import PlyData
@@ -605,7 +607,7 @@ class Basic_Utils():
                     self.config.lm_kps_dir, "{}/{}.txt".format(cls, kp_type)
                 )
                 kps_pth = kps_pattern.format(cls)
-            print("kps_pth in get_kps:", kps_pth)
+            # print("kps_pth in get_kps:", kps_pth)
             kps = np.loadtxt(kps_pth, dtype=np.float32)
             self.lm_cls_kps_dict[cls] = kps
         return kps.copy()
@@ -704,6 +706,8 @@ class Basic_Utils():
 
     def best_fit_transform(self, A, B):
         return best_fit_transform(A, B)
+
+
 
 
 if __name__ == "__main__":

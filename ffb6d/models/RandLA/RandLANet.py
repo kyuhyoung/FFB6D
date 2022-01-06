@@ -5,6 +5,7 @@ import models.RandLA.pytorch_utils as pt_utils
 from helper_tool import DataProcessing as DP
 import numpy as np
 from sklearn.metrics import confusion_matrix
+from torch.cuda.amp import autocast
 
 
 class Network(nn.Module):
@@ -39,7 +40,7 @@ class Network(nn.Module):
         self.fc2 = pt_utils.Conv2d(64, 32, kernel_size=(1,1), bn=True)
         self.dropout = nn.Dropout(0.5)
         self.fc3 = pt_utils.Conv2d(32, self.config.num_classes, kernel_size=(1,1), bn=False, activation=None)
-
+    @autocast()
     def forward(self, end_points):
 
         features = end_points['features']  # Batch*channel*npoints

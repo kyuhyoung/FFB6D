@@ -7,6 +7,7 @@ import numpy as np
 import torchvision.transforms as transforms
 from PIL import Image
 from common import Config
+
 import pickle as pkl
 from utils.basic_utils import Basic_Utils
 import yaml
@@ -40,47 +41,71 @@ class Dataset():
         self.cls_id = self.obj_dict[cls_type]
         print("cls_id in lm_dataset.py", self.cls_id)
         self.root = os.path.join(self.config.lm_root, 'Linemod_preprocessed')
+        self.U_root = os.path.join(self.config.lmu_root, 'Linemod_Unity')
         self.cls_root = os.path.join(self.root, "data/%02d/" % self.cls_id)
         self.rng = np.random
         meta_file = open(os.path.join(self.cls_root, 'gt.yml'), "r")
         self.meta_lst = yaml.load(meta_file)
+        self.U_cls_root = os.path.join(self.U_root, "data/%02d/" % self.cls_id)
+        LMU_img_pth = os.path.join(self.U_cls_root, "train.txt")
+        self.LMU_lst = self.bs_utils.read_lines(LMU_img_pth)
+        LMU_test_img_pth = os.path.join(self.U_cls_root, "test.txt")
+        U_meta_file = open(os.path.join(self.U_cls_root, 'gt.yml'), "r")
+        self.U_meta_lst = yaml.load(U_meta_file)
+        real_img_pth = os.path.join(
+            self.cls_root, "train.txt"
+        )
+        self.real_lst = self.bs_utils.read_lines(real_img_pth)
+
+        rnd_img_ptn = os.path.join(
+            self.root, 'renders/%s/*.pkl' % cls_type
+        )
+        self.rnd_lst = glob(rnd_img_ptn)
+        fuse_img_ptn = os.path.join(
+            self.root, 'fuse/%s/*.pkl' % cls_type
+        )
+        self.fuse_lst = glob(fuse_img_ptn)
+
         if dataset_name == 'train':
             self.add_noise = True
-            real_img_pth = os.path.join(
-                self.cls_root, "train.txt"
-            )
-            self.real_lst = self.bs_utils.read_lines(real_img_pth)
-
-            rnd_img_ptn = os.path.join(
-                self.root, 'renders/%s/*.pkl' % cls_type
-            )
-            self.rnd_lst = glob(rnd_img_ptn)
             print("render data length: ", len(self.rnd_lst))
-            if len(self.rnd_lst) == 0:
-                warning = "Warning: "
-                warning += "Trainnig without rendered data will hurt model performance \n"
-                warning += "Please generate rendered data from https://github.com/ethnhe/raster_triangle.\n"
-                print(colored(warning, "red", attrs=['bold']))
-
-            fuse_img_ptn = os.path.join(
-                self.root, 'fuse/%s/*.pkl' % cls_type
-            )
-            self.fuse_lst = glob(fuse_img_ptn)
             print("fused data length: ", len(self.fuse_lst))
-            if len(self.fuse_lst) == 0:
-                warning = "Warning: "
-                warning += "Trainnig without fused data will hurt model performance \n"
-                warning += "Please generate fused data from https://github.com/ethnhe/raster_triangle.\n"
-                print(colored(warning, "red", attrs=['bold']))
-
             self.all_lst = self.real_lst + self.rnd_lst + self.fuse_lst
-            self.minibatch_per_epoch = len(self.all_lst) // self.config.mini_batch_size
+            # For multi-domain
+            if self.config.multi_domain:
+                print("Unity data length: ", len(self.LMU_lst))
+                self.all_lst +=  self.LMU_lst
+
+        elif dataset_name=="source":
+            self.add_noise = True
+            print("Loading source dataset...")
+            print("render data length: ", len(self.rnd_lst))
+            print("fused data length: ", len(self.fuse_lst))
+            print("Unity data length: ", len(self.LMU_lst))
+            # self.all_lst = self.rnd_lst + self.fuse_lst + self.LMU_lst
+            self.all_lst = self.rnd_lst + self.fuse_lst + self.LMU_lst
+
+        elif dataset_name=="target":
+            self.add_noise = True
+            print("Loading target dataset...")
+            print("real data length: ", len(self.real_lst))
+            self.all_lst = self.real_lst
+        elif dataset_name=="valid":
+            self.add_noise = False
+            tst_img_pth = os.path.join(self.cls_root, "valid.txt")
+            self.tst_lst = self.bs_utils.read_lines(tst_img_pth)
+            self.all_lst = self.tst_lst
+        elif  dataset_name=="Unity_test":
+            self.add_noise = False
+            self.all_lst = self.bs_utils.read_lines(LMU_test_img_pth)
+            print("Unity test data lenght:", len(self.all_lst))
         else:
             self.add_noise = False
             tst_img_pth = os.path.join(self.cls_root, "test.txt")
             self.tst_lst = self.bs_utils.read_lines(tst_img_pth)
             self.all_lst = self.tst_lst
         print("{}_dataset_size: ".format(dataset_name), len(self.all_lst))
+        self.minibatch_per_epoch = len(self.all_lst) // self.config.mini_batch_size
 
     def real_syn_gen(self, real_ratio=0.3):
         if len(self.rnd_lst+self.fuse_lst) == 0:
@@ -104,6 +129,31 @@ class Dataset():
                 idx = self.rng.randint(0, len(self.rnd_lst))
                 pth = self.rnd_lst[idx]
             return pth
+    def real_syn_gen_MD(self, real_ratio=None): #multi-domain data randomizer
+        if real_ratio==None:
+            real_ratio = self.config.real_ratio
+        raster_triangle_ratio = 0.5
+        if self.rng.rand() < real_ratio: # real
+            n_imgs = len(self.real_lst)
+            idx = self.rng.randint(0, n_imgs)
+            pth = self.real_lst[idx]
+            # print('real', pth)
+            return pth, False
+        elif self.rng.rand() < raster_triangle_ratio: # raster_triangle
+            fuse_ratio = 0.4
+            if self.rng.rand() < fuse_ratio:
+                idx = self.rng.randint(0, len(self.fuse_lst))
+                pth = self.fuse_lst[idx]
+            else:
+                idx = self.rng.randint(0, len(self.rnd_lst))
+                pth = self.rnd_lst[idx]
+            return pth, False
+        else: # Unity
+            n_imgs = len(self.LMU_lst)
+            idx = self.rng.randint(0, n_imgs)
+            pth = self.LMU_lst[idx]
+            return pth, True
+
 
     def real_gen(self):
         n = len(self.real_lst)
@@ -119,7 +169,10 @@ class Dataset():
         img = img + rng.randn(*img.shape) * sigma
         img = np.clip(img, 0, 255).astype('uint8')
         return img
-
+    def transform_to_meter(self, x, near=1.4, far=2.6):
+        # set depth clipping planes in Unity
+        s = (far - near) / 255;
+        return (near + x * s)
     def linear_motion_blur(self, img, angle, length):
         """:param angle: in degree"""
         rad = np.deg2rad(angle)
@@ -198,7 +251,8 @@ class Dataset():
         dpt_3d = dpt_3d * msk[:, :, None]
         return dpt_3d
 
-    def get_item(self, item_name):
+
+    def get_item(self, item_name, Unity):
         if "pkl" in item_name:
             data = pkl.load(open(item_name, "rb"))
             dpt_mm = data['depth'] * 1000.
@@ -207,10 +261,31 @@ class Dataset():
             K = data['K']
             RT = data['RT']
             rnd_typ = data['rnd_typ']
+            domain_label = 1 # 0 for source, 1 for target
             if rnd_typ == "fuse":
                 labels = (labels == self.cls_id).astype("uint8")
             else:
                 labels = (labels > 0).astype("uint8")
+        elif Unity:
+            with Image.open(os.path.join(self.U_cls_root, "depth/{}.png".format(item_name))) as di:
+                dpt = np.array(di)
+                dpt = dpt[:, :, 0]
+                dpt_mm = self.transform_to_meter(dpt) * 1000
+            with Image.open(os.path.join(self.U_cls_root, "mask/{}.png".format(item_name))) as li:
+                labels = np.array(li)
+                labels = (labels > 0).astype("uint8")
+            with Image.open(os.path.join(self.U_cls_root, "rgb/{}.png".format(item_name))) as ri:
+                if self.add_noise:
+                    ri = self.trancolor(ri)
+                rgb = np.array(ri)[:, :, :3]
+            meta = self.U_meta_lst[int(item_name)]
+            R = np.resize(np.array(meta['cam_R_m2c']), (3, 3))
+            T = np.array(meta['cam_t_m2c'])
+            RT = np.concatenate((R, T[:, None]), axis=1)
+            rnd_typ = 'real'
+            K = self.config.intrinsic_matrix["linemod"]
+            domain_label = 1 # 0 for source, 1 for target
+
         else:
             with Image.open(os.path.join(self.cls_root, "depth/{}.png".format(item_name))) as di:
                 dpt_mm = np.array(di)
@@ -234,6 +309,8 @@ class Dataset():
             RT = np.concatenate((R, T[:, None]), axis=1)
             rnd_typ = 'real'
             K = self.config.intrinsic_matrix["linemod"]
+            domain_label = 0 # 0 for source, 1 for target
+
         cam_scale = 1000.0
         if len(labels.shape) > 2:
             labels = labels[:, :, 0]
@@ -249,8 +326,17 @@ class Dataset():
                     rgb = self.rgb_add_noise(rgb)
 
         dpt_mm = dpt_mm.copy().astype(np.uint16)
+        k_size = 5  # pixel, kernal size for computing the normal
+        if Unity:
+            distance_threshold = 3000  # mm,
+            difference_threshold = 40
+
+        else:
+            distance_threshold = 2000
+            difference_threshold = 20
+        point_into_surface = False  # Regular normal point out from the mesh
         nrm_map = normalSpeed.depth_normal(
-            dpt_mm, K[0][0], K[1][1], 5, 2000, 20, False
+            dpt_mm, K[0][0], K[1][1], k_size, distance_threshold, difference_threshold, point_into_surface
         )
         if self.DEBUG:
             show_nrm_map = ((nrm_map + 1.0) * 127).astype(np.uint8)
@@ -280,8 +366,10 @@ class Dataset():
         sf_idx = np.arange(choose.shape[0])
         np.random.shuffle(sf_idx)
         choose = choose[sf_idx]
-
         cld = dpt_xyz.reshape(-1, 3)[choose, :]
+        ## normal from PVN3D with pcl
+
+
         rgb_pt = rgb.reshape(-1, 3)[choose, :].astype(np.float32)
         nrm_pt = nrm_map[:, :, :3].reshape(-1, 3)[choose, :]
         labels_pt = labels.flatten()[choose]
@@ -383,13 +471,14 @@ class Dataset():
             cls_ids=cls_ids.astype(np.int32),
             ctr_3ds=ctr3ds.astype(np.float32),
             kp_3ds=kp3ds.astype(np.float32),
+            domain_label=domain_label
         )
         item_dict.update(inputs)
         if self.DEBUG:
             extra_d = dict(
                 dpt_xyz_nrm=dpt_6c.astype(np.float32),  # [6, h, w]
                 cam_scale=np.array([cam_scale]).astype(np.float32),
-                K=K.astype(np.float32),
+                K=K.astype(np.float32)
             )
             item_dict.update(extra_d)
             item_dict['normal_map'] = nrm_map[:, :, :3].astype(np.float32)
@@ -440,37 +529,57 @@ class Dataset():
 
     def __getitem__(self, idx):
         if self.dataset_name == 'train':
-            item_name = self.real_syn_gen()
-            data = self.get_item(item_name)
-            while data is None:
+            if self.config.multi_domain:
+                item_name, U_flag = self.real_syn_gen_MD()
+                data = self.get_item(item_name, U_flag)
+            else:
                 item_name = self.real_syn_gen()
-                data = self.get_item(item_name)
+                data = self.get_item(item_name, False)
+                while data is None:
+                    item_name = self.real_syn_gen()
+                    data = self.get_item(item_name, False)
             return data
+        elif self.dataset_name == 'source':
+            item_name, U_flag = self.real_syn_gen_MD(real_ratio=0)
+            data = self.get_item(item_name, U_flag)
+            return data
+        elif self.dataset_name == 'target':
+            item_name, U_flag = self.real_syn_gen_MD(real_ratio=1)
+            data = self.get_item(item_name, False)
+            return data
+        elif self.dataset_name == 'Unity_test':
+            item_name = self.all_lst[idx]
+            return self.get_item(item_name, Unity=True)
         else:
             item_name = self.all_lst[idx]
-            return self.get_item(item_name)
+            return self.get_item(item_name, Unity=False)
 
 
 def main():
     # config.mini_batch_size = 1
     ds = {}
-    cls = 'duck'
-    ds['train'] = Dataset('train', cls, DEBUG=True)
-    ds['test'] = Dataset('test', cls, DEBUG=True)
+    cls = 'ape'
+    # ds['train'] = Dataset('train', cls, DEBUG=True)
+    # ds['test'] = Dataset('test', cls, DEBUG=True)
+    ds['target'] = Dataset('target', cls, DEBUG=True)
+    ds['source'] = Dataset('source', cls, DEBUG=True)
     idx = dict(
         train=0,
         val=0,
-        test=0
+        test=0,
+        source=0,
+        target=0
     )
     while True:
         # for cat in ['val', 'test']:
         # for cat in ['test']:
-        for cat in ['train']:
+        for cat in ['target']:
             datum = ds[cat].__getitem__(idx[cat])
             idx[cat] += 1
             K = datum['K']
             cam_scale = datum['cam_scale']
             rgb = datum['rgb'].transpose(1, 2, 0)[..., ::-1].copy()  # [...,::-1].copy()
+
             for i in range(22):
                 pcld = datum['cld_rgb_nrm'][:3, :].transpose(1, 0).copy()
                 p2ds = ds[cat].bs_utils.project_p3d(pcld, cam_scale, K)

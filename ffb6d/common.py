@@ -4,6 +4,7 @@ import yaml
 import numpy as np
 
 
+
 def ensure_fd(fd):
     if not os.path.exists(fd):
         os.system('mkdir -p {}'.format(fd))
@@ -16,8 +17,8 @@ class ConfigRandLA:
     num_classes = 22  # Number of valid classes
     sub_grid_size = 0.06  # preprocess_parameter
 
-    batch_size = 3  # batch_size during training
-    val_batch_size = 3  # batch_size during validation and test
+    batch_size = 2  # batch_size during training
+    val_batch_size = 2  # batch_size during validation and test
     train_steps = 500  # Number of steps per epochs
     val_steps = 100  # Number of validation steps per epoch
     in_c = 9
@@ -41,9 +42,10 @@ class Config:
         ensure_fd(self.resnet_ptr_mdl_p)
 
         # log folder
+        self.log_root = '/mnt/audi/cwkim/DAKDN_exp'
         self.cls_type = cls_type
         self.log_dir = os.path.abspath(
-            os.path.join(self.exp_dir, 'train_log', self.dataset_name)
+            os.path.join(self.log_root, 'train_log', self.dataset_name)
         )
         ensure_fd(self.log_dir)
         self.log_model_dir = os.path.join(self.log_dir, 'checkpoints', self.cls_type)
@@ -54,7 +56,7 @@ class Config:
         ensure_fd(self.log_traininfo_dir)
 
         self.n_total_epoch = 25
-        self.mini_batch_size = 3
+        self.mini_batch_size = 2
         self.val_mini_batch_size = 3
         self.test_mini_batch_size = 1
 
@@ -64,6 +66,8 @@ class Config:
 
         self.noise_trans = 0.05  # range of the random noise of translation added to the training data
 
+        self.l1 = 0.5  # coefficient for domain loss
+        self.l2 = 0.3  # coefficient for structure loss
         self.preprocessed_testset_pth = ''
         if self.dataset_name == 'ycb':
             self.n_objects = 21 + 1  # 21 objects + background
@@ -94,6 +98,7 @@ class Config:
             self.ycb_r_lst = list(np.loadtxt(ycb_r_lst_p))
             self.ycb_cls_lst = self.read_lines(self.ycb_cls_lst_p)
             self.ycb_sym_cls_ids = [13, 16, 19, 20, 21]
+
         else:  # linemod
             self.n_objects = 1 + 1  # 1 object + background
             self.n_classes = self.n_objects
@@ -126,8 +131,15 @@ class Config:
             self.lm_root = os.path.abspath(
                 os.path.join(self.exp_dir, 'datasets/linemod/')
             )
+            self.lmu_root = os.path.abspath(
+                os.path.join(self.exp_dir, 'datasets/linemod_unity/')
+            )
+            # Parameters for domain domain adaptaiton
+            self.multi_domain = True
+            self.DA = True
+            self.real_ratio = 0.0
             self.use_orbfps = True
-            self.kp_orbfps_dir = 'datasets/linemod/kps_orb9_fps/'
+            self.kp_orbfps_dir = os.path.join(self.exp_dir,'datasets/linemod/kps_orb9_fps/')
             self.kp_orbfps_ptn = os.path.join(self.kp_orbfps_dir, '%s_%d_kps.txt')
             # FPS
             self.lm_fps_kps_dir = os.path.abspath(

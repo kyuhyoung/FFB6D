@@ -13,9 +13,11 @@ try:
     from neupeak.utils.webcv2 import imshow, waitKey
 except Exception:
     from cv2 import imshow, waitKey
+import cv2
 
 
 config = Config(ds_name='ycb')
+config_lmu = Config(ds_name="linemod_unity")
 bs_utils = Basic_Utils(config)
 cls_lst = config.ycb_cls_lst
 try:
@@ -317,7 +319,7 @@ def eval_one_frame_pose_lm(
     cls_add_dis, cls_adds_dis = eval_metric_lm(
         cls_ids, pred_pose_lst, RTs, mask, label, obj_id
     )
-    return (cls_add_dis, cls_adds_dis)
+    return (cls_add_dis, cls_adds_dis, pred_pose_lst)
 
 # ###############################End LineMOD Evaluation###############################
 
@@ -334,7 +336,9 @@ class TorchEval():
         self.pred_kp_errs = [list() for i in range(n_cls)]
         self.pred_id2pose_lst = []
         self.sym_cls_ids = []
-
+    def ensure_fd(self, fd):
+        if not os.path.exists(fd):
+            os.system('mkdir -p {}'.format(fd))
     def cal_auc(self):
         add_auc_lst = []
         adds_auc_lst = []
@@ -491,14 +495,43 @@ class TorchEval():
                         self.pred_kp_errs, pred_kp_errs
                     )
                 else:
-                    cls_add_dis_lst, cls_adds_dis_lst = res
+                    cls_add_dis_lst, cls_adds_dis_lst, pred_pose_lst = res
                 self.cls_add_dis = self.merge_lst(
                     self.cls_add_dis, cls_add_dis_lst
                 )
                 self.cls_adds_dis = self.merge_lst(
                     self.cls_adds_dis, cls_adds_dis_lst
                 )
+        return pred_pose_lst
 
+    def cal_view_pred_pose(self, rgb, pred_pose_lst, filename=None, obj_id=-1, dataset='linemod_unity', GT=False, is_track=False):
+        np_rgb = rgb.cpu().numpy().astype("uint8")[0].transpose(1, 2, 0)[..., ::-1].copy()
+        pose = pred_pose_lst[0]
+        mesh_pts = bs_utils.get_pointxyz(obj_id, ds_type=dataset).copy()
+        mesh_pts = np.dot(mesh_pts, pose[:, :3].T) + pose[:, 3]
+        if dataset == "ycb":
+            K = config.intrinsic_matrix["ycb_K1"]
+            conf = config
+        elif dataset == "linemod":
+            K = config_lm.intrinsic_matrix["linemod"]
+            conf = config_lm
+        else:
+            K = config_lm.intrinsic_matrix["linemod"]
+            conf = config_lmu
+
+
+        mesh_p2ds = bs_utils.project_p3d(mesh_pts, 1.0, K)
+        color = bs_utils.get_label_color(obj_id, n_obj=22, mode=1)
+        np_rgb = bs_utils.draw_p2ds(np_rgb, mesh_p2ds, color=color)
+        vis_dir = os.path.join(conf.log_eval_dir, "pose_vis")
+        self.ensure_fd(vis_dir)
+        if GT:
+            f_pth = os.path.join(vis_dir, "{}_GT.jpg".format(filename))
+        elif is_track:
+            f_pth = os.path.join(vis_dir, "{}_tracked.jpg".format(filename))
+        else:
+            f_pth = os.path.join(vis_dir, "{}.jpg".format(filename))
+        cv2.imwrite(f_pth, np_rgb)
     def merge_lst(self, targ, src):
         for i in range(len(targ)):
             targ[i] += src[i]
