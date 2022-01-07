@@ -5,6 +5,9 @@ from __future__ import (
     print_function,
     unicode_literals,
 )
+
+
+
 import os
 import time
 import tqdm
@@ -33,10 +36,11 @@ from models.loss import OFLoss, FocalLoss
 from utils.pvn3d_eval_utils_kpls import TorchEval
 from utils.basic_utils import Basic_Utils
 import datasets.linemod.linemod_dataset as dataset_desc
-
 from apex.parallel import DistributedDataParallel
 from apex.parallel import convert_syncbn_model
+
 from apex import amp
+
 from apex.multi_tensor_apply import multi_tensor_applier
 
 
@@ -238,8 +242,6 @@ def model_fn_decorator(
                     cu_dt[key] = data[key].float().cuda()
                 elif data[key].dtype in [torch.int32, torch.int16]:
                     cu_dt[key] = data[key].long().cuda()
-            # from torch.cuda.amp import autocast
-            # with autocast():
             end_points = model(cu_dt)
 
             labels = cu_dt['labels']
@@ -256,7 +258,7 @@ def model_fn_decorator(
             loss_lst = [
                 (loss_rgbd_seg, 2.0), (loss_kp_of, 1.0), (loss_ctr_of, 1.0),
             ]
-            loss = sum([ls * w for ls, w in loss_lst])
+            loss = sum([ls * w for ls, w in loss_lst])            
             # print('Total loss:{} in {} iter.'.format(loss, it))
 
             _, cls_rgbd = torch.max(end_points['pred_rgbd_segs'], 1)
@@ -433,6 +435,7 @@ class Trainer(object):
         tot_iter=1,
         clr_div=6,
     ):
+        
         r"""
            Call to begin training the model
 
@@ -480,12 +483,18 @@ class Trainer(object):
                 np.random.seed()
                 if log_epoch_f is not None:
                     os.system("echo {} > {}".format(epoch, log_epoch_f))
+                    
                 for batch in train_loader:
                     self.model.train()
 
                     self.optimizer.zero_grad()
                     _, loss, res = self.model_fn(self.model, batch, it=it)
 
+                    
+                    
+                    
+                    
+                    
                     with amp.scale_loss(loss, self.optimizer) as scaled_loss:
                         scaled_loss.backward()
                     lr = get_lr(self.optimizer)
@@ -547,46 +556,24 @@ class Trainer(object):
                 writer.export_scalars_to_json("./all_scalars.json")
                 writer.close()
         return best_loss
-
-
 def MMD(x, y, kernel):
     device = torch.device('cuda:{}'.format(args.local_rank))
-    """Emprical maximum mean discrepancy. The lower the result
-       the more evidence that distributions are the same.
-
+    """Emprical maximum mean discrepancy. The lower the result the more evidence that distributions are the same.
     Args:
-        x: first sample, distribution P
-        y: second sample, distribution Q
-        kernel: kernel type such as "multiscale" or "rbf"
+        x: first sample, distribution P, y: second sample, distribution Q, kernel: kernel type such as "multiscale" or "rbf"
     """
     xx, yy, zz = torch.mm(x, x.t()), torch.mm(y, y.t()), torch.mm(x, y.t())
-    rx = (xx.diag().unsqueeze(0).expand_as(xx))
-    ry = (yy.diag().unsqueeze(0).expand_as(yy))
-
-    dxx = rx.t() + rx - 2. * xx  # Used for A in (1)
-    dyy = ry.t() + ry - 2. * yy  # Used for B in (1)
-    dxy = rx.t() + ry - 2. * zz  # Used for C in (1)
-
-    XX, YY, XY = (torch.zeros(xx.shape).to(device),
-                  torch.zeros(xx.shape).to(device),
-                  torch.zeros(xx.shape).to(device))
-
+    rx = (xx.diag().unsqueeze(0).expand_as(xx));    ry = (yy.diag().unsqueeze(0).expand_as(yy))
+    dxx = rx.t() + rx - 2. * xx;    dyy = ry.t() + ry - 2. * yy;    dxy = rx.t() + ry - 2. * zz  # Used for C in (1)
+    XX, YY, XY = (torch.zeros(xx.shape).to(device), torch.zeros(xx.shape).to(device), torch.zeros(xx.shape).to(device))
     if kernel == "multiscale":
-
         bandwidth_range = [0.2, 0.5, 0.9, 1.3]
         for a in bandwidth_range:
-            XX += a ** 2 * (a ** 2 + dxx) ** -1
-            YY += a ** 2 * (a ** 2 + dyy) ** -1
-            XY += a ** 2 * (a ** 2 + dxy) ** -1
-
+            XX += a ** 2 * (a ** 2 + dxx) ** -1;    YY += a ** 2 * (a ** 2 + dyy) ** -1;    XY += a ** 2 * (a ** 2 + dxy) ** -1
     if kernel == "rbf":
-
         bandwidth_range = [10, 15, 20, 50]
         for a in bandwidth_range:
-            XX += torch.exp(-0.5 * dxx / a)
-            YY += torch.exp(-0.5 * dyy / a)
-            XY += torch.exp(-0.5 * dxy / a)
-
+            XX += torch.exp(-0.5 * dxx / a);    YY += torch.exp(-0.5 * dyy / a);    XY += torch.exp(-0.5 * dxy / a)
     return torch.mean(XX + YY - 2. * XY)
 def train():
     print("local_rank:", args.local_rank)
@@ -611,6 +598,13 @@ def train():
             drop_last=True, num_workers=4, sampler=train_sampler, pin_memory=True
         )
 
+        
+        
+        
+        
+        
+        
+        
         val_ds = dataset_desc.Dataset('valid', cls_type=args.cls)
         val_sampler = torch.utils.data.distributed.DistributedSampler(val_ds)
         val_loader = torch.utils.data.DataLoader(
